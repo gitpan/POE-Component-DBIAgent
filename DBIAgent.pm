@@ -64,13 +64,13 @@ to manage it).  The only method is C<query()>.
 
 Not EVERY query should run through the DBI agent.  If you need to run
 a short query within a state, sometimes it can be a hassle to have to
-define a whole seperate state to receive it's value.  The determining
+define a whole seperate state to receive its value.  The determining
 factor, of course, is how long your query will take.  If you are
 trying to retrieve one row from a properly indexed table, use
-C<$dbh-E<gt>selectrow_array()>.  If there's a join involved, or multiple
-rows, or a view, use DBIAgent.  If it's a longish query and startup
-costs don't matter to you, do it inline.  If startup costs DO matter,
-use the Agent.
+C<$dbh-E<gt>selectrow_array()>.  If there's a join involved, or
+multiple rows, or a view, use DBIAgent.  If it's a longish query and
+startup costs don't matter to you, do it inline.  If startup costs DO
+matter, use the Agent.
 
 =head2 Return Values
 
@@ -86,7 +86,7 @@ be as follows:
      #...
      if ($enough_values_to_begin_updating) {
 
-	 $heap->{dbiagent}->query(update_values =>
+	 $heap->{dbiagent}->query(update_values_query =>
 				  this_session =>
 				  update_next_value =>
 				  shift @{$heap->{values_to_be_updated}}
@@ -124,12 +124,13 @@ use POE qw/Session Filter::Line Wheel::Run Component::DBIAgent::Helper Component
 
 use vars qw/$VERSION/;
 
-$VERSION = sprintf("%d.%02d", q$Revision: 0.11 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 0.12 $ =~ /(\d+)\.(\d+)/);
 
 use constant DEFAULT_KIDS => 3;
 
 #sub debug { $_[0]->{debug} }
-sub debug { 0 }
+sub debug { 1 }
+#sub debug { 0 }
 
 #sub carp { warn @_ }
 #sub croak { die @_ }
@@ -294,7 +295,8 @@ sub _start {
 					  StdoutEvent => 'db_reply',
 					  StderrEvent => 'remote_stderr',
 					  ErrorEvent  => 'error',
-					  Filter => POE::Filter::Line->new(),
+					  StdinFilter => POE::Filter::Line->new(),
+					  StderrFilter => POE::Filter::Line->new(),
 					  StdoutFilter => POE::Filter::Line->new( Literal => CRLF),
 					 )
 	  or carp "Can't create new Wheel::Run: $!\n";

@@ -121,13 +121,13 @@ sub run {
 
 	last if /^EXIT$/;	# allow parent to tell us to exit
 
-	my( $id, $package, $state, @rest ) = split( /\|/, $_ );
+	my( $id, $package, $state, @params ) = split( /\|/, $_ );
 
 	if ($id eq 'CREATE') {
 	    next;
 	}
 
-	DEBUG && warn "  QA: Read line: $id for $state (params @rest)\n";
+	DEBUG && warn "  QA: Read line: $id for $state (params @params)\n";
 	#print STDOUT "Read line: $id", CRLF;
 
 	unless (exists $self->{$id}) {
@@ -142,7 +142,7 @@ sub run {
 	# This is true if $self->{$id} is a DBI statement handle.
 	if (ref $self->{$id}) {
 	    # Normal query loop.  This is where we usually go.
-	    unless ( $self->{$id}->execute( @rest ) ) {
+	    unless ( $self->{$id}->execute( @params ) ) {
 		DEBUG && warn "  QA: error executing query: ", $self->{$id}->errstr,"\n";
 
 		#print "ERROR|", $self->{$id}->errstr, "\n";
@@ -175,7 +175,7 @@ sub run {
 	    my $query = $queries->{$id};
 
 	    # Replace ? placeholders with bind values.
-	    $query =~ s/\?/shift @rest/eg;
+	    $query =~ s/\?/shift @params/eg;
 
 	    DEBUG && warn "  QA: $query\n";
 	    print "$package|$state|EOF", CRLF;
@@ -199,6 +199,7 @@ sub _init_dbi {
 
     $dbh->{AutoCommit} = 1;
     $dbh->{RaiseError} = 0;
+    #$dbh->{RowCacheSize} = 500;
 
     #local $dbh->{RaiseError} = 1; # unless keys %hits; # There... it's FRESH
 
