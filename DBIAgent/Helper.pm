@@ -1,5 +1,162 @@
 package POE::Component::DBIAgent::Helper;
 
+use DBI;
+#use Daemon; # qw//;
+use Socket qw/:crlf/;
+use Data::Dumper;
+use Storable qw/freeze thaw/;
+use POE::Filter::Reference;
+
+use strict;
+
+use vars qw/$VERSION/;
+$VERSION = sprintf("%d.%02d", q$Revision: 0.01 $ =~ /(\d+)\.(\d+)/);
+
+#my $debug = 1;
+
+use constant DEBUG => 0;
+use constant DEBUG_UPDATE => 0;
+
+
+my $filter = POE::Filter::Reference->new();
+
+sub run {
+
+    DEBUG && warn "  QA: start\n";
+    DEBUG_UPDATE && warn "  QA: NO UPDATE\n";
+
+    my ($type, $dsn, $queries) = @_;
+
+    my $self = bless {}, $type;
+    $self->_init_dbi($dsn, $queries);
+
+    $| = 1;
+
+    $self->{dbh}->{RaiseError} = 0;
+    $self->{dbh}->{PrintError} = 0;
+
+    DEBUG && warn "  QA: initialized\n";
+
+    my $row;			# to hold DBI result
+    my $output;
+    while ( sysread( STDIN, my $buffer = '', 1024 ) ) {
+	my $lines = $filter->get( [ $buffer ] );
+	# DEBUG && warn "  QA: Got lines: ", Dumper($lines, ), "\n";
+
+	foreach (@$lines) {
+	    DEBUG && warn "  QA: Got line: ", Dumper($_), "\n";
+
+	    last if /^EXIT$/;	# allow parent to tell us to exit
+
+	    #my( $id, $package, $state, @params ) = split( /\|/, ${$_} );
+	    my( $id, $package, $state, @params );
+	    ( $id, $package, $state ) = @{$_}{qw/query package state/};
+	    @params = @{$_->{params} || []};
+
+	if ($id eq 'CREATE') {
+	    next;
+	}
+
+	DEBUG && warn "  QA: Read data: $id for $state (params @params)\n";
+
+	unless (exists $self->{$id}) {
+	    DEBUG && warn "  QA: No such query: $id";
+	    next;
+	}
+	DEBUG && warn "  QA: query $id exists\n";
+
+	my $rowcount = 0;
+
+	my $result = { package => $package, state => $state, data => undef };
+
+	# This is true if $self->{$id} is a DBI statement handle.
+	if (ref $self->{$id}) {
+	    # Normal query loop.  This is where we usually go.
+	    unless ( $self->{$id}->execute( @params ) ) {
+		DEBUG && warn "  QA: error executing query: ", $self->{$id}->errstr,"\n";
+
+		#print "ERROR|", $self->{$id}->errstr, "\n";
+	    } else {
+		DEBUG && warn "  QA: query running\n";
+
+		if ($self->{$id}{Active}) {
+		    while (defined ($row = $self->{$id}->fetchrow_arrayref)) {
+
+			$rowcount++;
+
+			$result->{data} = $row;
+			$output = $filter->put( [ $result ] );
+			print @$output;
+			#warn "  QA: got row $rowcount: ",,"\n";
+
+		    }
+		}
+
+		$result->{data} = 'EOF';
+		$output = $filter->put( [ $result ] );
+		print @$output;
+		DEBUG && warn "  QA: ROWS|$rowcount\n";
+
+	    }
+
+	} else {		# *NOT* a DBI statement handle
+
+	    # $queries->{$id} is a STRING of the query.  This is a debug
+	    # feature.  Print a debug message, and send back EOF,
+	    # but don't actually touch the database.
+	    my $query = $queries->{$id};
+
+	    # Replace ? placeholders with bind values.
+	    $query =~ s/\?/shift @params/eg;
+
+	    DEBUG && warn "  QA: $query\n";
+
+	    $result->{data} = 'EOF';
+	    $output = $filter->put( [ $result ] );
+	    print @$output;
+
+	}
+
+    } }
+
+    $self->{dbh}->disconnect;
+
+}
+
+# {{{ _init_dbi
+
+sub _init_dbi {
+    my ($heap, $dsn, $queries) = @_;
+
+    my $dbh = DBI->connect(@$dsn) or die DBI->errstr;
+    $heap->{dbh} = $dbh;
+
+    $dbh->{AutoCommit} = 1;
+    $dbh->{RaiseError} = 0;
+    #$dbh->{RowCacheSize} = 500;
+
+    #local $dbh->{RaiseError} = 1; # unless keys %hits; # There... it's FRESH
+
+    if (defined $queries) {
+	foreach (keys %$queries) {
+	    if (DEBUG_UPDATE && $queries->{$_} =~ /insert|update|delete/i) {
+		$heap->{$_} = $queries->{$_};
+	    } else {
+		$heap->{$_} = $dbh->prepare($queries->{$_}) or die $dbh->errstr;
+	    }
+	}
+
+	return;
+    }
+
+}
+
+# }}} _init_dbi
+
+1;
+
+__END__
+
 =head1 NAME
 
 POE::Component::DBIAgent::Helper - DBI Query Helper for DBIAgent
@@ -19,8 +176,9 @@ POE::Component::DBIAgent::Helper - DBI Query Helper for DBIAgent
 	     StdoutEvent => 'db_reply',
 	     StderrEvent => 'remote_stderr',
 	     ErrorEvent  => 'error',
-	     Filter => POE::Filter::Line->new(),
+	     StdinFilter => POE::Filter::Line->new(),
 	     StdoutFilter => POE::Filter::Line->new( Literal => CRLF),
+	     StderrFilter => POE::Filter::Line->new(),
 	    )
       or carp "Can't create new DBIAgent::Helper: $!\n";
 
@@ -38,7 +196,6 @@ POE::Component::DBIAgent::Helper - DBI Query Helper for DBIAgent
     # $input is either the string 'EOF' or a Storable object.
 
  }
-
 
 =head1 DESCRIPTION
 
@@ -74,154 +231,6 @@ A hashref of the form Query_Name => "$SQL".  See
 L<POE::Component::DBIAgent> for details.
 
 =back
-
-=cut
-
-use DBI;
-#use Daemon; # qw//;
-use Socket qw/:crlf/;
-use Data::Dumper;
-use Storable qw/freeze thaw/;
-
-use strict;
-
-use vars qw/$VERSION/;
-$VERSION = sprintf("%d.%02d", q$Revision: 0.01 $ =~ /(\d+)\.(\d+)/);
-
-#my $debug = 1;
-
-use constant DEBUG => 0;
-use constant DEBUG_UPDATE => 0;
-
-sub run {
-
-    DEBUG && warn "  QA: start\n";
-    DEBUG_UPDATE && warn "  QA: NO UPDATE\n";
-
-    my ($type, $dsn, $queries) = @_;
-
-    my $self = bless {}, $type;
-    $self->_init_dbi($dsn, $queries);
-
-    $| = 1;
-
-    # Input record seperator uses Network Newlines (so we know what to chomp);
-    $/ = CRLF;
-
-    $self->{dbh}->{RaiseError} = 0;
-    $self->{dbh}->{PrintError} = 0;
-
-    DEBUG && warn "  QA: initialized\n";
-
-    my $row;			# to hold DBI result
-    while ( <STDIN> ) {
-	chomp;
-
-	DEBUG && warn "  QA: Got line: $_\n";
-
-	last if /^EXIT$/;	# allow parent to tell us to exit
-
-	my( $id, $package, $state, @params ) = split( /\|/, $_ );
-
-	if ($id eq 'CREATE') {
-	    next;
-	}
-
-	DEBUG && warn "  QA: Read line: $id for $state (params @params)\n";
-	#print STDOUT "Read line: $id", CRLF;
-
-	unless (exists $self->{$id}) {
-	    DEBUG && warn "  QA: No such query: $id";
-	    #print "ERROR|No such query: $id", CRLF;
-	    next;
-	}
-	DEBUG && warn "  QA: query $id exists\n";
-
-	my $rowcount = 0;
-
-	# This is true if $self->{$id} is a DBI statement handle.
-	if (ref $self->{$id}) {
-	    # Normal query loop.  This is where we usually go.
-	    unless ( $self->{$id}->execute( @params ) ) {
-		DEBUG && warn "  QA: error executing query: ", $self->{$id}->errstr,"\n";
-
-		#print "ERROR|", $self->{$id}->errstr, "\n";
-	    } else {
-		DEBUG && warn "  QA: query running\n";
-
-		if ($self->{$id}{Active}) {
-		    while (defined ($row = $self->{$id}->fetchrow_arrayref)) {
-
-			$rowcount++;
-
-			# Serialize via Storable: We use CRLF because Storable
-			# uses \n in its streams, so we need to use \r\n for
-			# end-of-line.
-			print "$package|$state|", freeze($row), CRLF;
-			#warn "  QA: got row $rowcount: ",,"\n";
-
-		    }
-		}
-		print "$package|$state|EOF", CRLF;
-		DEBUG && warn "  QA: ROWS|$rowcount\n";
-
-	    }
-
-	} else {		# *NOT* a DBI statement handle
-
-	    # $queries->{$id} is a STRING of the query.  This is a debug
-	    # feature.  Print a debug message, and send back EOF,
-	    # but don't actually touch the database.
-	    my $query = $queries->{$id};
-
-	    # Replace ? placeholders with bind values.
-	    $query =~ s/\?/shift @params/eg;
-
-	    DEBUG && warn "  QA: $query\n";
-	    print "$package|$state|EOF", CRLF;
-
-	}
-
-    }
-
-    $self->{dbh}->disconnect;
-
-}
-
-
-# {{{ _init_dbi
-
-sub _init_dbi {
-    my ($heap, $dsn, $queries) = @_;
-
-    my $dbh = DBI->connect(@$dsn) or die DBI->errstr;
-    $heap->{dbh} = $dbh;
-
-    $dbh->{AutoCommit} = 1;
-    $dbh->{RaiseError} = 0;
-    #$dbh->{RowCacheSize} = 500;
-
-    #local $dbh->{RaiseError} = 1; # unless keys %hits; # There... it's FRESH
-
-    if (defined $queries) {
-	foreach (keys %$queries) {
-	    if (DEBUG_UPDATE && $queries->{$_} =~ /insert|update|delete/i) {
-		$heap->{$_} = $queries->{$_};
-	    } else {
-		$heap->{$_} = $dbh->prepare($queries->{$_}) or die $dbh->errstr;
-	    }
-	}
-
-	return;
-    }
-
-}
-
-# }}} _init_dbi
-
-1;
-
-__END__
 
 =head1 BUGS
 

@@ -34,9 +34,9 @@ use Class::MethodMaker
   ;
 
 sub init {
-  my $self = shift;
+    my $self = shift;
 
-  return $self;
+    return $self;
 }
 
 =head2 Methods
@@ -66,10 +66,10 @@ sub clear { $_[0]->_queue_clear }
 ##             returns true
 ##
 sub _find_by {
-  my( $self, $predicate ) = @_;
-  my $queue = $self->_queue;
-  my @ret = grep $predicate->( $queue->[ $_ ] ), 0..$#{$queue};
-  return wantarray ? @ret : $ret[0];
+    my( $self, $predicate ) = @_;
+    my $queue = $self->_queue;
+    my @ret = grep $predicate->( $queue->[ $_ ] ), 0..$#{$queue};
+    return wantarray ? @ret : $ret[0];
 }
 
 =item find_by_pid
@@ -79,8 +79,8 @@ Find the index of helper with specified pid
 =cut
 
 sub find_by_pid {
-  my( $self, $pid ) = @_;
-  return $self->_find_by( sub { $_[0]->PID == $pid } );
+    my( $self, $pid ) = @_;
+    return $self->_find_by( sub { $_[0]->PID == $pid } );
 }
 
 =item find_by_wheelid
@@ -90,8 +90,8 @@ Find the index of helper with specified wheel id
 =cut
 
 sub find_by_wheelid {
-  my( $self, $wheel_id ) = @_;
-  return $self->_find_by( sub { $_[0]->ID == $wheel_id } );
+    my( $self, $wheel_id ) = @_;
+    return $self->_find_by( sub { $_[0]->ID == $wheel_id } );
 }
 
 ## Internal use only
@@ -99,12 +99,12 @@ sub find_by_wheelid {
 ##               predicate returns true
 ##
 sub _remove_by {
-  my( $self, $predicate ) = @_;
-  my $index = ( $self->_find_by( $predicate ) )[0];
+    my( $self, $predicate ) = @_;
+    my $index = ( $self->_find_by( $predicate ) )[0];
 
-  return splice( @{scalar $self->_queue}, $index, 1 ) if defined $index;
+    return splice( @{scalar $self->_queue}, $index, 1 ) if defined $index;
 
-  return
+    return
 }
 
 =item remove_by_pid
@@ -114,8 +114,8 @@ Remove helper with specified pid
 =cut
 
 sub remove_by_pid {
-  my( $self, $pid ) = @_;
-  $self->_remove_by( sub { $_[0]->PID == $pid } );
+    my( $self, $pid ) = @_;
+    $self->_remove_by( sub { $_[0]->PID == $pid } );
 }
 
 =item remove_by_wheelid
@@ -125,8 +125,8 @@ Remove helper with specified wheel id
 =cut
 
 sub remove_by_wheelid {
-  my( $self, $wheel_id ) = @_;
-  $self->_remove_by( sub { $_[0]->ID == $wheel_id } );
+    my( $self, $wheel_id ) = @_;
+    $self->_remove_by( sub { $_[0]->ID == $wheel_id } );
 }
 
 =item next
@@ -137,11 +137,23 @@ Get next helper off the head of the queue (and put it back on the end
 =cut
 
 sub next {
-  my $self = shift;
-  my $ret = $self->_queue_shift;
-  $self->_queue_push( $ret );
-  return $ret
+    my $self = shift;
+    my $ret = $self->_queue_shift;
+    $self->_queue_push( $ret );
+    return $ret
 }
+
+=item exit_all
+
+Tell all our helpers to exit gracefully.
+
+=cut
+
+sub exit_all {
+    my $self = shift;
+    $_->put("EXIT") foreach $self->_queue;
+}
+
 
 =item kill_all
 
@@ -150,14 +162,19 @@ Send the specified signal (default SIGTERM) to all helper processes
 =cut
 
 sub kill_all {
-  my $self = shift;
-  my $sig = shift || 'TERM';
+    my $self = shift;
+    my $sig = shift || 'TERM';
 
-  kill $sig => $_ foreach map { $_->PID } $self->_queue;
+    my @helpers = map { $_->PID } $self->_queue;
+    if (@helpers) {
+	kill $sig => @helpers;
+    }
 
-  $self->_queue_clear;
+    # Causes @helpers to be empty on subsequent kill_all() calls.  This
+    # was here already; I'm just commenting it.
+    $self->_queue_clear;
 
-  return
+    return
 }
 
 =back

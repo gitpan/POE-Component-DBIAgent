@@ -114,23 +114,24 @@ be as follows:
 
 # }}} POD
 
-use Socket qw/:crlf/;
 #use Data::Dumper;
 use Storable qw/freeze thaw/;
 use Carp;
 
 use strict;
-use POE qw/Session Filter::Line Wheel::Run Component::DBIAgent::Helper Component::DBIAgent::Queue/;
+use POE qw/Session Filter::Reference Wheel::Run Component::DBIAgent::Helper Component::DBIAgent::Queue/;
 
 use vars qw/$VERSION/;
 
-$VERSION = sprintf("%d.%02d", q$Revision: 0.12 $ =~ /(\d+)\.(\d+)/);
+# 0.14's big difference is: we switched to Filter::Reference instead of Filter::Line!
+
+$VERSION = sprintf("%d.%02d", q$Revision: 0.14 $ =~ /(\d+)\.(\d+)/);
 
 use constant DEFAULT_KIDS => 3;
 
 #sub debug { $_[0]->{debug} }
-sub debug { 1 }
-#sub debug { 0 }
+#sub debug { 1 }
+sub debug { 0 }
 
 #sub carp { warn @_ }
 #sub croak { die @_ }
@@ -163,13 +164,14 @@ A hashref of the form Query_Name => "$SQL".  For example:
                           where item_id = ?",
  }
 
-As the example indicates, DBI placeholders are supported, as are DML statements.
+As the example indicates, DBI placeholders are supported, as are DML
+statements.
 
 =item Count
 
 The number of helper processes to spawn.  Defaults to 3.  The optimal
 value for this parameter will depend on several factors, such as: how
-many different queries you'll be running, how much RAM you have, how
+many different queries you will be running, how much RAM you have, how
 often you run queries, and how many queries you intend to run
 I<simultaneously>.
 
@@ -197,9 +199,7 @@ sub new {
     # croak "Queries needs to be a hash reference" unless ref $queries eq 'HASH';
 
     my $debug = delete $params{Debug} || 0;
-    if ($debug) {
-	# $count = 1;
-    }
+    # $count = 1 if $debug;
 
     # Make sure the user didn't pass in parameters we're not aware of.
     if (scalar keys %params) {
@@ -214,6 +214,8 @@ sub new {
     $self->{queries} = $queries;
     $self->{count} = $count;
     $self->{debug} = $debug;
+    $self->{finish} = 0;
+    $self->{pending_query_count} = 0;
 
     POE::Session->new( $self,
 		       [ qw [ _start _stop db_reply remote_stderr error ] ]
@@ -225,6 +227,8 @@ sub new {
 # }}} new
 
 # {{{ query
+
+# {{{ POD
 
 =head2 query(I<query_name>, I<session>, I<state>, [ I<parameter, parameter, ...> ])
 
@@ -261,16 +265,50 @@ this syntax are welcome.  Consider this subject to change.
 
 =cut
 
+# }}} POD
+
 sub query {
     my ($self, $query, $package, $state, @rest) = @_;
 
     $self->debug && carp "QA: Running query ($query) for package ($package) to state ($state)\n";
+    #my $line = join ('|', $query, $package, $state, @rest);
+    my $input = { query => $query, package => $package, state => $state, params => \@rest };
 
-    $self->{helper}->next->put(join '|', $query, $package, $state, @rest);
-
+    $self->{helper}->next->put( $input );
+    $self->{pending_query_count}++;
 }
 
 # }}} query
+
+#========================================================================================
+# {{{ shutdown
+
+=head2 finish()
+
+The C<finish()> method tells DBIAgent that the program is finished
+sending queries.  DBIAgent will shut its helpers down gracefully after
+they complete any pending queries.  If there are no pending queries,
+the DBIAgent will shut down immediately.
+
+=cut
+
+sub finish {
+    my $self = shift;
+
+    $self->{finish} = 1;
+
+    unless ($self->{pending_query_count}) {
+      $self->debug and carp "QA: finish() called without pending queries. Shutting down now.";
+      $self->{helper}->exit_all();
+    }
+    else {
+      $self->debug && carp "QA: Setting finish flag for later.\n";
+    }
+}
+
+# }}} shutdown
+
+#========================================================================================
 
 # {{{ STATES
 
@@ -285,6 +323,7 @@ sub _start {
     #$kernel->alias_set( 'qa' );
 
     my $queue = POE::Component::DBIAgent::Queue->new();
+    $self->{filter} = POE::Filter::Reference->new();
 
     ## Input and output from the children will be line oriented
     foreach (1..$self->{count}) {
@@ -295,9 +334,9 @@ sub _start {
 					  StdoutEvent => 'db_reply',
 					  StderrEvent => 'remote_stderr',
 					  ErrorEvent  => 'error',
-					  StdinFilter => POE::Filter::Line->new(),
-					  StderrFilter => POE::Filter::Line->new(),
-					  StdoutFilter => POE::Filter::Line->new( Literal => CRLF),
+					  #StdinFilter => POE::Filter::Line->new(),
+					  StdinFilter => POE::Filter::Reference->new(),
+					  StdoutFilter => POE::Filter::Reference->new(),
 					 )
 	  or carp "Can't create new Wheel::Run: $!\n";
 	$self->debug && carp __PACKAGE__, " Started db helper pid ", $helper->PID, " wheel ", $helper->ID, "\n";
@@ -332,42 +371,50 @@ sub db_reply {
 
     # Parse the "receiving state" and dispatch the input line to that state.
 
-    my ($package, $state, $rest) = split /\|/, $input, 3;
-    my $obj;
+    # not needed for Filter::Reference
+    my ($package, $state, $data);
+    $package = $input->{package};
+    $state = $input->{state};
+    $data = $input->{data};
 
+    unless (ref $data) {
+	warn "QA: Got $data\n";
+    }
     # $self->debug && $self->debug && carp "QA: received db_reply for $package => $state\n";
 
-    unless (defined $rest) {
+    unless (defined $data) {
 	$self->debug && carp "QA: Empty input value.\n";
 	return;
     }
 
-    if ($rest eq 'EOF') {
+    if ($data eq 'EOF') {
 	$self->debug && warn "QA: Got EOF\n";
-	$obj = $rest;
-    } else {
+        $self->{pending_query_count}--;
 
-	eval { $obj = thaw($rest) };
+        # If this was the last query to go, and we've been requested
+        # to finish, then turn out the lights.
+        unless ($self->{pending_query_count}) {
+          if ($self->{finish}) {
+            $self->debug and warn "QA: Last query done, and finish flag set.  Shutting down.\n";
+            $self->{helper}->exit_all();
+          }
+        }
+        elsif ($self->debug and $self->{pending_query_count} < 0) {
+          die "QA: Pending query count went negative (should never do that)";
+        }
 
-	unless (defined $obj) {
-	    if ($@) {
-		warn "QA: Data error: $@\n";
-	    } else {
-		$self->debug && carp "QA: Undefined error... corrupt input line?\n"
-	    }
-	}
     }
 
-    if (defined $obj) {
-	if (0 && $self->debug) {
-	    if ($obj eq 'EOF') {
+    if (defined $data) {
+	if (0 and $self->debug) {
+	    if ($data eq 'EOF') {
 		carp "Calling $package => $state => 'EOF'\n";
 	    } else {
-		carp "Calling $package => $state => \$obj\n";
-		#carp Data::Dumper->Dump([$obj],[qw/$obj/]);
+		carp "Calling $package => $state => \$data\n";
+		#carp Data::Dumper->Dump([$data],[qw/$data/]);
 	    }
 	}
-	$kernel->call($package => $state => $obj);
+	$kernel->call($package => $state => $data);
     }
 
 
@@ -394,8 +441,10 @@ sub remote_stderr {
 sub error {
     my ($self, $operation, $errnum, $errstr, $wheel_id) = @_[OBJECT, ARG0..ARG3];
 
-    $self->debug && carp "error: Wheel $wheel_id generated $operation error $errnum: $errstr\n";
+    $errstr = "child process closed connection" unless $errnum;
+    $self->debug and carp "error: Wheel $wheel_id generated $operation error $errnum: $errstr\n";
 
+    $self->{helper}->remove_by_wheelid($wheel_id);
 }
 
 # }}} error
@@ -432,13 +481,13 @@ every query, especially if you have a lot of miscellaneous queries.
 
 =back
 
-Suggestions welcome!  Diffs *more* welcome! :-)
+Suggestions welcome!  Diffs I<more> welcome! :-)
 
 =head1 AUTHOR
 
 This module has been fine-tuned and packaged by Rob Bloodgood
-E<lt>robb@empire2.comE<gt>.  However, alot the code came directly from
-Fletch E<lt>fletch@phydeaux.orgE<gt>, either directly
+E<lt>robb@empire2.comE<gt>.  However, alot of the code came directly
+from Fletch E<lt>fletch@phydeaux.orgE<gt>, either directly
 (Po:Co:DBIAgent:Queue) or via his ideas.  Thank you, Fletch!
 
 However, I own all of the bugs.

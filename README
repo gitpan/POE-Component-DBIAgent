@@ -39,3 +39,11 @@ is 99.6% his.  I just packaged it up and wrote docs... (*his* was tied
 into his program... *I* made distributable. :-)
 
 Rob Bloodgood <robb@empire2.com>
+
+
+POE::Component::DBIAgent 0.13
+Updated worker code, to notify individual agents of component shutdown.
+
+POE::Component::DBIAgent 0.14
+Finally got rid of Filter::Line!  All communication from the component to the agents
+is now via Filter::Reference... woo-hoo!

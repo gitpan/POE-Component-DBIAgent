@@ -1,5 +1,7 @@
 Revision history for Perl extension POE::Component::DBIAgent.
 
+0.13 Added finish() method to signal helper shutdown.
+
 0.12 POE changed the syntax for calling POE::Wheel::Run.  So, syntax updated.
 
 0.11 Initial release, part 2... this one saw daylight. :-)
