@@ -1,5 +1,8 @@
 Revision history for Perl extension POE::Component::DBIAgent. -*-text-*-
 
+0.21 Forgot to add the parameter passing code in the main to complete
+     cookie support.  The HELPER understood it... <sigh>
+
 0.20 Reworked the query() syntax.  Added an optional parameter hash to
      query(), which obsoleted query_slow in favor of delay => 1.  Also
      added query cookies, to facilitate more advanced query handling.

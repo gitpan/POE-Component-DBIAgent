@@ -26,12 +26,14 @@ POE::Component::DBIAgent - POE Component for running asynchronous DBI calls.
 	#   etc.
 	# }
 
-    $heap->{helper}->query(query_name => session => 'get_row_from_dbiagent');
+    $heap->{helper}->query(query_name =>
+			   { cookie => 'starting_query' },
+			   session => 'get_row_from_dbiagent');
 
  }
 
- sub get_row_from_qa {
-    my ($kernel, $self, $heap, $row) = @_[KERNEL, OBJECT, HEAP, ARG0];
+ sub get_row_from_dbiagent {
+    my ($kernel, $self, $heap, $row, $cookie) = @_[KERNEL, OBJECT, HEAP, ARG0, ARG1];
     if ($row ne 'EOF') {
 
  # {{{ PROCESS A ROW
@@ -70,7 +72,7 @@ destination session (name or id) and destination state (as well as any
 query parameters, optionally) as arguments.  As each row of data comes
 back from the query, the destination state (in the destination
 session) is invoked with that row of data in its C<$_[ARG0]> slot.  When
-there are no more rows to return, the data in C<ARG0> is the string
+there are no more rows to return, the data in C<$_[ARG0]> is the string
 'EOF'.
 
 Not EVERY query should run through the DBIAgent.  If you need to run a
@@ -93,7 +95,7 @@ its C<$_[ARG0]> parameter.  DBIAgent invokes DBI's C<fetch> method
 internally, so the value will be a reference to an array.  If your
 query returns multiple rows, then your state will be invoked multiple
 times, once per row.  B<ADDITIONALLY>, your state will be called one
-time with C<ARG0> containing the string 'EOF'. 'EOF' is returned I<even
+time with C<$_[ARG0]> containing the string 'EOF'. 'EOF' is returned I<even
 if the query doesn't return any other rows>.  This is also what to
 expect for DML (INSERT, UPDATE, DELETE) queries.  A way to utilise
 this might be as follows:
@@ -142,7 +144,7 @@ use vars qw/$VERSION/;
 
 # 0.14's big difference is: we switched to Filter::Reference instead of Filter::Line!
 
-$VERSION = sprintf("%d.%02d", q$Revision: 0.20 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 0.21 $ =~ /(\d+)\.(\d+)/);
 
 use constant DEFAULT_KIDS => 3;
 
@@ -276,9 +278,10 @@ Return rows hash references instead of array references.
 =item cookie
 
 A cookie to pass to this query.  This is passed back unchanged to the
-destination state.  Can be any scalar (including references, so be
-careful!).  You can use this as an identifier if you have one
-destination state handling multiple different queries or sessions.
+destination state in C<$_[ARG1]>.  Can be any scalar (including
+references, so be careful!).  You can use this as an identifier if you
+have one destination state handling multiple different queries or
+sessions.
 
 =item delay
 
@@ -309,9 +312,9 @@ If Time::HiRes is not installed, the delay is ignored.
 
 These parameters indicate the POE state that is to receive the data
 returned from the database.  The state indicated will receive the data
-in its C<ARG0> parameter.  I<PLEASE> make sure this is a valid state,
-otherwise you will spend a LOT of time banging your head against the
-wall wondering where your query data is.
+in its C<$_[ARG0]> parameter.  I<PLEASE> make sure this is a valid
+state, otherwise you will spend a LOT of time banging your head
+against the wall wondering where your query data is.
 
 =item @parameters
 
@@ -466,10 +469,11 @@ sub db_reply {
     # Parse the "receiving state" and dispatch the input line to that state.
 
     # not needed for Filter::Reference
-    my ($package, $state, $data);
+    my ($package, $state, $data, $cookie);
     $package = $input->{package};
     $state = $input->{state};
     $data = $input->{data};
+    $cookie = $input->{cookie};
 
     unless (ref $data or $data eq 'EOF') {
 	warn "QA: Got $data\n";
@@ -530,15 +534,7 @@ sub db_reply {
     }
 
     if (defined $data) {
-	if (0 and $self->debug) {
-	    if ($data eq 'EOF') {
-		warn "Calling $package => $state => 'EOF'\n";
-	    } else {
-		warn "Calling $package => $state => \$data\n";
-		#warn Data::Dumper->Dump([$data],[qw/$data/]);
-	    }
-	}
-	$kernel->post($package => $state => $data);
+	$kernel->post($package => $state => $data => $cookie);
     }
 
 
