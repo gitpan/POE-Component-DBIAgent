@@ -7,23 +7,30 @@ use Data::Dumper;
 use Storable qw/freeze thaw/;
 use POE::Filter::Reference;
 
+BEGIN {
+    my $can_delay = 0;
+    eval { require Time::HiRes; };
+    unless ($@) {
+	Time::HiRes->import(qw/usleep/);
+	$can_delay = 1;
+    }
+    sub CAN_DELAY { $can_delay }
+
+}
 use strict;
 
 use vars qw/$VERSION/;
-$VERSION = sprintf("%d.%02d", q$Revision: 0.01 $ =~ /(\d+)\.(\d+)/);
-
-#my $debug = 1;
+$VERSION = sprintf("%d.%02d", q$Revision: 0.03 $ =~ /(\d+)\.(\d+)/);
 
 use constant DEBUG => 0;
-use constant DEBUG_UPDATE => 0;
-
+use constant DEBUG_NOUPDATE => 0;
 
 my $filter = POE::Filter::Reference->new();
 
 sub run {
 
     DEBUG && warn "  QA: start\n";
-    DEBUG_UPDATE && warn "  QA: NO UPDATE\n";
+    DEBUG_NOUPDATE && warn "  QA: NO UPDATE\n";
 
     my ($type, $dsn, $queries) = @_;
 
@@ -43,81 +50,94 @@ sub run {
 	my $lines = $filter->get( [ $buffer ] );
 	# DEBUG && warn "  QA: Got lines: ", Dumper($lines, ), "\n";
 
-	foreach (@$lines) {
-	    DEBUG && warn "  QA: Got line: ", Dumper($_), "\n";
+	foreach my $task (@$lines) {
+	    DEBUG && warn "  QA: Got line: ", Dumper($task), "\n";
 
 	    last if /^EXIT$/;	# allow parent to tell us to exit
 
-	    #my( $id, $package, $state, @params ) = split( /\|/, ${$_} );
-	    my( $id, $package, $state, @params );
-	    ( $id, $package, $state ) = @{$_}{qw/query package state/};
-	    @params = @{$_->{params} || []};
+	    # Set up query
+	    my ($query_id);
+	    $query_id = $task->{query};
+	    my $rowtype = $task->{hash} ? 'fetchrow_hashref' : 'fetchrow_arrayref';
 
-	if ($id eq 'CREATE') {
-	    next;
-	}
+	    if ($query_id eq 'CREATE') {
+		next;
+	    }
 
-	DEBUG && warn "  QA: Read data: $id for $state (params @params)\n";
+	    DEBUG && warn "  QA: Read data: $query_id for $task->{state} (params @{$task->{params}})\n";
 
-	unless (exists $self->{$id}) {
-	    DEBUG && warn "  QA: No such query: $id";
-	    next;
-	}
-	DEBUG && warn "  QA: query $id exists\n";
+	    unless (exists $self->{$query_id}) {
+		DEBUG && warn "  QA: No such query: $query_id";
+		next;
+	    }
+	    DEBUG && warn "  QA: query $query_id exists\n";
 
-	my $rowcount = 0;
+	    my $rowcount = 0;
 
-	my $result = { package => $package, state => $state, data => undef };
+	    my $result = { package => $task->{package}, state => $task->{state},
+			   data => undef,
+			   query => $query_id,
+			   id => $task->{id},
+			   cookie => $task->{cookie} || undef,
+			 };
 
-	# This is true if $self->{$id} is a DBI statement handle.
-	if (ref $self->{$id}) {
-	    # Normal query loop.  This is where we usually go.
-	    unless ( $self->{$id}->execute( @params ) ) {
-		DEBUG && warn "  QA: error executing query: ", $self->{$id}->errstr,"\n";
+	    # This is true if $self->{$query_id} is a DBI statement handle.
+	    if (ref $self->{$query_id}) {
 
-		#print "ERROR|", $self->{$id}->errstr, "\n";
-	    } else {
-		DEBUG && warn "  QA: query running\n";
+		# Normal query loop.  This is where we usually go.
+		unless ( $self->{$query_id}->execute( @{$task->{params}} ) ) {
+		    DEBUG && warn "  QA: error executing query: ", $self->{$query_id}->errstr,"\n";
 
-		if ($self->{$id}{Active}) {
-		    while (defined ($row = $self->{$id}->fetchrow_arrayref)) {
+		    #print "ERROR|", $self->{$query_id}->errstr, "\n";
+		} else {
+		    DEBUG && warn "  QA: query running\n";
 
-			$rowcount++;
+		    if ($self->{$query_id}{Active}) {
+			while (defined ($row = $self->{$query_id}->$rowtype())) {
 
-			$result->{data} = $row;
-			$output = $filter->put( [ $result ] );
-			print @$output;
-			#warn "  QA: got row $rowcount: ",,"\n";
+			    $rowcount++;
 
+			    $result->{data} = $row;
+			    $output = $filter->put( [ $result ] );
+
+			    # This prevents monopolizing the parent with
+			    # db responses.
+			    CAN_DELAY and $task->{delay} and usleep(1);
+
+			    print @$output;
+			    #warn "  QA: got row $rowcount: ",,"\n";
+
+			}
 		    }
+
+		    $result->{data} = 'EOF';
+		    $output = $filter->put( [ $result ] );
+		    print @$output;
+		    DEBUG && warn "  QA: ROWS|$rowcount\n";
+
 		}
+
+	    } else {		# *NOT* a DBI statement handle
+
+		# $queries->{$query_id} is a STRING query.  This is a
+		# debug feature.  Print a debug message, and send back
+		# EOF, but don't actually touch the database.
+		my $query = $queries->{$query_id};
+
+		my @params = @{$task->{params}};
+		# Replace ? placeholders with bind values.
+		$query =~ s/\?/@params/eg;
+
+		DEBUG && warn "  QA: $query\n";
 
 		$result->{data} = 'EOF';
 		$output = $filter->put( [ $result ] );
 		print @$output;
-		DEBUG && warn "  QA: ROWS|$rowcount\n";
 
 	    }
 
-	} else {		# *NOT* a DBI statement handle
-
-	    # $queries->{$id} is a STRING of the query.  This is a debug
-	    # feature.  Print a debug message, and send back EOF,
-	    # but don't actually touch the database.
-	    my $query = $queries->{$id};
-
-	    # Replace ? placeholders with bind values.
-	    $query =~ s/\?/shift @params/eg;
-
-	    DEBUG && warn "  QA: $query\n";
-
-	    $result->{data} = 'EOF';
-	    $output = $filter->put( [ $result ] );
-	    print @$output;
-
 	}
-
-    } }
+    }
 
     $self->{dbh}->disconnect;
 
@@ -139,7 +159,7 @@ sub _init_dbi {
 
     if (defined $queries) {
 	foreach (keys %$queries) {
-	    if (DEBUG_UPDATE && $queries->{$_} =~ /insert|update|delete/i) {
+	    if (DEBUG_NOUPDATE && $queries->{$_} =~ /insert|update|delete/i) {
 		$heap->{$_} = $queries->{$_};
 	    } else {
 		$heap->{$_} = $dbh->prepare($queries->{$_}) or die $dbh->errstr;

@@ -16,6 +16,7 @@ POE::Component::DBIAgent - POE Component for running asynchronous DBI calls.
 					       $password
 					      ],
 				       Queries => $self->make_queries,
+				       Count => 3,
 				       Debug => 1,
 				     );
 
@@ -54,33 +55,48 @@ POE::Component::DBIAgent - POE Component for running asynchronous DBI calls.
 
 =head1 DESCRIPTION
 
-The DBIAgent is your answer to non-blocking DBI in POE.
+DBIAgent is your answer to non-blocking DBI in POE.
 
-It fires off child processes (configurable, defaults to 3) and feeds
-database queries to it via two-way pipe (or however Wheel::Run is able
-to manage it).  The only method is C<query()>.
+It fires off a configurable number child processes (defaults to 3) and
+feeds database queries to it via two-way pipe (or sockets ... however
+POE::Component::Wheel::Run is able to manage it).  The primary method
+is C<query>.
 
 =head2 Usage
 
-Not EVERY query should run through the DBI agent.  If you need to run
-a short query within a state, sometimes it can be a hassle to have to
-define a whole seperate state to receive its value.  The determining
-factor, of course, is how long your query will take.  If you are
-trying to retrieve one row from a properly indexed table, use
+After initializing a DBIAgent and storing it in a session's heap, one
+executes a C<query> (or C<query_slow>) with the query name,
+destination session (name or id) and destination state (as well as any
+query parameters, optionally) as arguments.  As each row of data comes
+back from the query, the destination state (in the destination
+session) is invoked with that row of data in its C<$_[ARG0]> slot.  When
+there are no more rows to return, the data in C<ARG0> is the string
+'EOF'.
+
+Not EVERY query should run through the DBIAgent.  If you need to run a
+short lookup from within a state, sometimes it can be a hassle to have
+to define a whole seperate state to receive its value, and resume
+processing from there..  The determining factor, of course, is how
+long your query will take to execute.  If you are trying to retrieve
+one row from a properly indexed table, use
 C<$dbh-E<gt>selectrow_array()>.  If there's a join involved, or
-multiple rows, or a view, use DBIAgent.  If it's a longish query and
-startup costs don't matter to you, do it inline.  If startup costs DO
-matter, use the Agent.
+multiple rows, or a view, you probably want to use DBIAgent.  If it's
+a longish query and startup costs (time) don't matter to you, go ahead
+and do it inline.. but remember the whole of your program suspends
+waiting for the result.  If startup costs DO matter, use DBIAgent.
 
 =head2 Return Values
 
-The state in the session specified in the call to C<query()> will
-receive in its ARG0 parameter the return value from the query.  If
-your query returns multiple rows, then your state will be called
-multiple times, once per row.  ADDITIONALLY, your state will be called
-one time with ARG0 containing the string 'EOF'.  For DML (INSERT,
-UPDATE, DELETE), this is the only time.  A way to utilise this might
-be as follows:
+The destination state in the destination session (specified in the
+call to C<query()>) will receive the return values from the query in
+its C<$_[ARG0]> parameter.  DBIAgent invokes DBI's C<fetch> method
+internally, so the value will be a reference to an array.  If your
+query returns multiple rows, then your state will be invoked multiple
+times, once per row.  B<ADDITIONALLY>, your state will be called one
+time with C<ARG0> containing the string 'EOF'. 'EOF' is returned I<even
+if the query doesn't return any other rows>.  This is also what to
+expect for DML (INSERT, UPDATE, DELETE) queries.  A way to utilise
+this might be as follows:
 
  sub some_state {
      #...
@@ -96,7 +112,8 @@ be as follows:
 
  sub update_next_value {
      my ($self, $heap) = @_[OBJECT, HEAP];
-     # we got 'EOF' in ARG0 here but we don't care
+     # we got 'EOF' in ARG0 here but we don't care... we know that an
+     # update has been executed.
 
      for (1..3) {		# Do three at a time!
 	 my $value;
@@ -125,13 +142,13 @@ use vars qw/$VERSION/;
 
 # 0.14's big difference is: we switched to Filter::Reference instead of Filter::Line!
 
-$VERSION = sprintf("%d.%02d", q$Revision: 0.14 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 0.20 $ =~ /(\d+)\.(\d+)/);
 
 use constant DEFAULT_KIDS => 3;
 
-#sub debug { $_[0]->{debug} }
+sub debug { $_[0]->{debug} }
 #sub debug { 1 }
-sub debug { 0 }
+#sub debug { 0 }
 
 #sub carp { warn @_ }
 #sub croak { die @_ }
@@ -171,9 +188,9 @@ statements.
 
 The number of helper processes to spawn.  Defaults to 3.  The optimal
 value for this parameter will depend on several factors, such as: how
-many different queries you will be running, how much RAM you have, how
-often you run queries, and how many queries you intend to run
-I<simultaneously>.
+many different queries your program will be running, how much RAM you
+have, how often you run queries, and most importantly, how many
+queries you intend to run I<simultaneously>.
 
 =back
 
@@ -216,6 +233,7 @@ sub new {
     $self->{debug} = $debug;
     $self->{finish} = 0;
     $self->{pending_query_count} = 0;
+    $self->{active_query_count} = 0;
 
     POE::Session->new( $self,
 		       [ qw [ _start _stop db_reply remote_stderr error ] ]
@@ -230,20 +248,64 @@ sub new {
 
 # {{{ POD
 
-=head2 query(I<query_name>, I<session>, I<state>, [ I<parameter, parameter, ...> ])
+=head2 query(I<$query_name>, [ \%args, ] I<$session>, I<$state>, [ I<@parameters> ])
 
 The C<query()> method takes at least three parameters, plus any bind
 values for the specific query you are executing.
 
 =over
 
-=item Query Name
+=item $query_name
 
 This parameter must be one of the keys to the Queries hashref you
 passed to the constructor.  It is used to indicate which query you
 wish to execute.
 
-=item Session, State
+=item \%args
+
+This is an OPTIONAL hashref of arguments to pass to the query.
+
+Currently supported arguments:
+
+=over 4
+
+=item hash
+
+Return rows hash references instead of array references.
+
+=item cookie
+
+A cookie to pass to this query.  This is passed back unchanged to the
+destination state.  Can be any scalar (including references, so be
+careful!).  You can use this as an identifier if you have one
+destination state handling multiple different queries or sessions.
+
+=item delay
+
+Insert a 1ms delay between each row of output.
+
+I know what you're thinking: "WHY would you want to slow down query
+responses?!?!?"  It has to do with CONCURRENCY.  When a response
+(finally) comes in from the agent after running the query, it floods
+the input channel with response data.  This has the effect of
+monopolizing POE's attention, so that any other handles (network
+sockets, pipes, file descriptors) keep getting pushed further back on
+the queue, and to all other processes EXCEPT the agent, your POE
+program looks hung for the amount of time it takes to process all of
+the incoming query data.
+
+So, we insert 1ms of time via Time::HiRes's C<usleep> function.  In
+human terms, this is essentially negligible.  But it is just enough
+time to allow competing handles (sockets, files) to trigger
+C<select()>, and get handled by the POE::Kernel, in situations where
+concurrency has priority over transfer rate.
+
+Naturally, the Time::HiRes module is required for this functionality.
+If Time::HiRes is not installed, the delay is ignored.
+
+=back
+
+=item $session, $state
 
 These parameters indicate the POE state that is to receive the data
 returned from the database.  The state indicated will receive the data
@@ -251,15 +313,14 @@ in its C<ARG0> parameter.  I<PLEASE> make sure this is a valid state,
 otherwise you will spend a LOT of time banging your head against the
 wall wondering where your query data is.
 
-=item Query Parameters
+=item @parameters
 
 These are any parameters your query requires.  B<WARNING:> You must
 supply exactly as many parameters as your query has placeholders!
 This means that if your query has NO placeholders, then you should
-pass NO extra parameters to C<query()>.
+pass NO extra parameters to C<query>.
 
-Since this is the first release of this module, suggestions to improve
-this syntax are welcome.  Consider this subject to change.
+Suggestions to improve this syntax are welcome.
 
 =back
 
@@ -269,13 +330,46 @@ this syntax are welcome.  Consider this subject to change.
 
 sub query {
     my ($self, $query, $package, $state, @rest) = @_;
+    my $options = {};
 
-    $self->debug && carp "QA: Running query ($query) for package ($package) to state ($state)\n";
-    #my $line = join ('|', $query, $package, $state, @rest);
-    my $input = { query => $query, package => $package, state => $state, params => \@rest };
+    if (ref $package) {
+	unless (ref $package eq 'HASH') {
+	    carp "Options has must be a HASH reference";
+	}
+	$options = $package;
 
-    $self->{helper}->next->put( $input );
+	# this shifts the first element off of @rest and puts it into
+	# $state
+	($package, $state) = ($state, shift @rest);
+    }
+
+    my $agent = $self->{helper}->next;
+    my $input = { query => $query,
+		  package => $package, state => $state,
+		  params => \@rest,
+		  delay => 0,
+		  id => "_",
+		  %$options,
+		};
+
     $self->{pending_query_count}++;
+    if ($self->{active_query_count} < $self->{count} ) {
+
+	$input->{id} = $agent->ID;
+	$agent->put( $input );
+	$self->{active_query_count}++;
+
+    } else {
+	push @{$self->{pending_queries}}, $input;
+    }
+
+    $self->debug
+      && warn sprintf("QA:(#%s) %d pending: %s => %s\n",
+		      $input->{id}, $self->{pending_query_count},
+		      $input->{query},
+		      "$input->{package}::$input->{state}"
+		     );
+
 }
 
 # }}} query
@@ -317,7 +411,7 @@ sub finish {
 sub _start {
     my ($self, $kernel, $heap, $dsn, $queries) = @_[OBJECT, KERNEL, HEAP, ARG0, ARG1];
 
-    $self->debug && carp __PACKAGE__ . " received _start.\n";
+    $self->debug && warn __PACKAGE__ . " received _start.\n";
 
     # make this session accessible to the others.
     #$kernel->alias_set( 'qa' );
@@ -338,8 +432,8 @@ sub _start {
 					  StdinFilter => POE::Filter::Reference->new(),
 					  StdoutFilter => POE::Filter::Reference->new(),
 					 )
-	  or carp "Can't create new Wheel::Run: $!\n";
-	$self->debug && carp __PACKAGE__, " Started db helper pid ", $helper->PID, " wheel ", $helper->ID, "\n";
+	  or warn "Can't create new Wheel::Run: $!\n";
+	$self->debug && warn __PACKAGE__, " Started db helper pid ", $helper->PID, " wheel ", $helper->ID, "\n";
 	$queue->add($helper);
     }
 
@@ -358,7 +452,7 @@ sub _stop {
     # Oracle clients don't like to TERMinate sometimes.
     $self->{helper}->kill_all(9);
 
-    $self->debug && carp __PACKAGE__ . " has stopped.\n";
+    $self->debug && warn __PACKAGE__ . " has stopped.\n";
 
 }
 
@@ -377,19 +471,25 @@ sub db_reply {
     $state = $input->{state};
     $data = $input->{data};
 
-    unless (ref $data) {
+    unless (ref $data or $data eq 'EOF') {
 	warn "QA: Got $data\n";
     }
-    # $self->debug && $self->debug && carp "QA: received db_reply for $package => $state\n";
+    # $self->debug && $self->debug && warn "QA: received db_reply for $package => $state\n";
 
     unless (defined $data) {
-	$self->debug && carp "QA: Empty input value.\n";
+	$self->debug && warn "QA: Empty input value.\n";
 	return;
     }
 
     if ($data eq 'EOF') {
-	$self->debug && warn "QA: Got EOF\n";
+	# $self->debug && warn "QA: ${package}::${state} (#$input->{id}): EOF\n";
         $self->{pending_query_count}--;
+	$self->{active_query_count}--;
+
+	$self->debug
+	  && warn sprintf("QA:(#%s) %d pending: EOF => %s\n",
+			  $input->{id}, $self->{pending_query_count},
+			 "$input->{package}::$input->{state}");
 
         # If this was the last query to go, and we've been requested
         # to finish, then turn out the lights.
@@ -403,18 +503,42 @@ sub db_reply {
           die "QA: Pending query count went negative (should never do that)";
         }
 
+	# place this agent at the front of the queue, for next query
+	$self->{helper}->make_next($input->{id});
+
+	if ( $self->{pending_queries} and
+	     @{$self->{pending_queries}} and
+	     $self->{active_query_count} < $self->{count}
+	   ) {
+
+	    my $input = shift @{$self->{pending_queries}};
+	    my $agent = $self->{helper}->next;
+
+	    $input->{id} = $agent->ID;
+	    $agent->put( $input );
+	    $self->{active_query_count}++;
+
+	    $self->debug &&
+	      warn sprintf("QA:(#%s) %d pending: %s => %s\n",
+			 $input->{id}, $self->{pending_query_count},
+			   $input->{query},
+			   "$input->{package}::$input->{state}"
+			  );
+
+	}
+
     }
 
     if (defined $data) {
 	if (0 and $self->debug) {
 	    if ($data eq 'EOF') {
-		carp "Calling $package => $state => 'EOF'\n";
+		warn "Calling $package => $state => 'EOF'\n";
 	    } else {
-		carp "Calling $package => $state => \$data\n";
-		#carp Data::Dumper->Dump([$data],[qw/$data/]);
+		warn "Calling $package => $state => \$data\n";
+		#warn Data::Dumper->Dump([$data],[qw/$data/]);
 	    }
 	}
-	$kernel->call($package => $state => $data);
+	$kernel->post($package => $state => $data);
     }
 
 
@@ -427,11 +551,11 @@ sub db_reply {
 sub remote_stderr {
     my ($self, $operation, $errnum, $errstr, $wheel_id) = @_[OBJECT, ARG0..ARG3];
 
-    #$self->debug && carp "read from qa: $operation";
+    #$self->debug && warn "read from qa: $operation";
 
     my $error = $operation;
 
-    $self->debug && carp "$operation: $errstr\n";
+    $self->debug && warn "$operation: $errstr\n";
 
 }
 
@@ -442,7 +566,7 @@ sub error {
     my ($self, $operation, $errnum, $errstr, $wheel_id) = @_[OBJECT, ARG0..ARG3];
 
     $errstr = "child process closed connection" unless $errnum;
-    $self->debug and carp "error: Wheel $wheel_id generated $operation error $errnum: $errstr\n";
+    $self->debug and warn "error: Wheel $wheel_id generated $operation error $errnum: $errstr\n";
 
     $self->{helper}->remove_by_wheelid($wheel_id);
 }
@@ -465,7 +589,9 @@ Error handling is practically non-existent.
 
 =item *
 
-The calling syntax is still pretty weak.
+The calling syntax is still pretty weak... but improving.  We may
+eventually add an optional attributes hash so that each query can be
+called with its own individual characteristics.
 
 =item *
 
@@ -486,9 +612,9 @@ Suggestions welcome!  Diffs I<more> welcome! :-)
 =head1 AUTHOR
 
 This module has been fine-tuned and packaged by Rob Bloodgood
-E<lt>robb@empire2.comE<gt>.  However, alot of the code came directly
-from Fletch E<lt>fletch@phydeaux.orgE<gt>, either directly
-(Po:Co:DBIAgent:Queue) or via his ideas.  Thank you, Fletch!
+E<lt>robb@empire2.comE<gt>.  However, most of the queuing code
+originated with Fletch E<lt>fletch@phydeaux.orgE<gt>, either directly
+or via his ideas.  Thank you for making this module a reality, Fletch!
 
 However, I own all of the bugs.
 

@@ -21,7 +21,7 @@ round-robin queue of Po:Co:DBIAgent:Helper's.
 
 =cut
 
-$VERSION = sprintf("%d.%02d", q$Revision: 0.01 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 0.02 $ =~ /(\d+)\.(\d+)/);
 
 use strict;
 
@@ -141,6 +141,19 @@ sub next {
     my $ret = $self->_queue_shift;
     $self->_queue_push( $ret );
     return $ret
+}
+
+=item make_next
+
+Force the helper with the specified wheel id to the head of the queue.
+
+=cut
+
+sub make_next {
+    my $self = shift;
+    my $id = shift;
+    my $ret = $self->remove_by_wheelid( $id );
+    $self->_queue_unshift( $ret );
 }
 
 =item exit_all
