@@ -2,9 +2,7 @@ package POE::Component::DBIAgent::Helper;
 
 use DBI;
 #use Daemon; # qw//;
-use Socket qw/:crlf/;
 use Data::Dumper;
-use Storable qw/freeze thaw/;
 use POE::Filter::Reference;
 
 BEGIN {
@@ -44,27 +42,31 @@ sub run {
 
     DEBUG && warn "  QA: initialized\n";
 
-    my $row;			# to hold DBI result
-    my $output;
+    my ($row, $output);		# to hold DBI results
     while ( sysread( STDIN, my $buffer = '', 1024 ) ) {
 	my $lines = $filter->get( [ $buffer ] );
-	# DEBUG && warn "  QA: Got lines: ", Dumper($lines, ), "\n";
+
+	#++ look for the exit sign in the current set of commands
+	my $exit = grep /^EXIT$/, map $_->{query}, @$lines;
+	### DEBUG && warn "Exit? - ", $exit, "\n";
 
 	foreach my $task (@$lines) {
-	    DEBUG && warn "  QA: Got line: ", Dumper($task), "\n";
+	    ### DEBUG && warn "  QA: Got line: ", Dumper($task), "\n";
 
-	    last if /^EXIT$/;	# allow parent to tell us to exit
+	    #++ this doesn't match what DBIAgent::Queue sends in exit_all();
+	    # last if /^EXIT$/;	# allow parent to tell us to exit
 
 	    # Set up query
 	    my ($query_id);
 	    $query_id = $task->{query};
 	    my $rowtype = $task->{hash} ? 'fetchrow_hashref' : 'fetchrow_arrayref';
 
-	    if ($query_id eq 'CREATE') {
+	    if ($query_id eq 'CREATE' or $query_id eq 'EXIT') {
+		#++  make sure the EXIT event isn't actually sent to the db
 		next;
 	    }
 
-	    DEBUG && warn "  QA: Read data: $query_id for $task->{state} (params @{$task->{params}})\n";
+	    ### DEBUG && warn "  QA: Read data: $query_id for $task->{state} (params @{$task->{params}})\n";
 
 	    unless (exists $self->{$query_id}) {
 		DEBUG && warn "  QA: No such query: $query_id";
@@ -78,15 +80,23 @@ sub run {
 			   data => undef,
 			   query => $query_id,
 			   id => $task->{id},
-			   cookie => $task->{cookie} || undef,
+			   cookie => $task->{cookie} || undef, # XXX remove?
+			   group => $task->{group},
 			 };
 
-	    # This is true if $self->{$query_id} is a DBI statement handle.
-	    if (ref $self->{$query_id}) {
+	    if (ref $self->{$query_id}) { # Is it a DBI statement handle?
 
 		# Normal query loop.  This is where we usually go.
 		unless ( $self->{$query_id}->execute( @{$task->{params}} ) ) {
 		    DEBUG && warn "  QA: error executing query: ", $self->{$query_id}->errstr,"\n";
+
+		    # this goes to stderr.  If an ErrorState was
+		    # supplied, the user will see this message.
+		    warn "QA: error executing query: ", $self->{$query_id}->errstr,"\n";
+
+		    $result->{data} = 'EOF';
+		    $output = $filter->put( [ $result ] );
+		    print @$output;
 
 		    #print "ERROR|", $self->{$query_id}->errstr, "\n";
 		} else {
@@ -135,10 +145,12 @@ sub run {
 		print @$output;
 
 	    }
-
 	}
+	#++ put here to make sure all the queries in the current buffer are dealt with before disconnecting 
+	last if $exit;
     }
 
+    DEBUG && warn "  QA: Disconnect and Exit\n";
     $self->{dbh}->disconnect;
 
 }
@@ -148,18 +160,14 @@ sub run {
 sub _init_dbi {
     my ($heap, $dsn, $queries) = @_;
 
-    my $dbh = DBI->connect(@$dsn) or die DBI->errstr;
+    my $dbh = DBI->connect(@$dsn, { AutoCommit => 1, RaiseError => 0, PrintError => 0 }) or die DBI->errstr;
     $heap->{dbh} = $dbh;
 
-    $dbh->{AutoCommit} = 1;
-    $dbh->{RaiseError} = 0;
     #$dbh->{RowCacheSize} = 500;
-
-    #local $dbh->{RaiseError} = 1; # unless keys %hits; # There... it's FRESH
 
     if (defined $queries) {
 	foreach (keys %$queries) {
-	    if (DEBUG_NOUPDATE && $queries->{$_} =~ /insert|update|delete/i) {
+	    if ($queries->{$_} =~ /insert|update|delete/i and DEBUG_NOUPDATE) {
 		$heap->{$_} = $queries->{$_};
 	    } else {
 		$heap->{$_} = $dbh->prepare($queries->{$_}) or die $dbh->errstr;

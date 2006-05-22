@@ -142,9 +142,7 @@ use POE qw/Session Filter::Reference Wheel::Run Component::DBIAgent::Helper Comp
 
 use vars qw/$VERSION/;
 
-# 0.14's big difference is: we switched to Filter::Reference instead of Filter::Line!
-
-$VERSION = sprintf("%d.%02d", q$Revision: 0.21 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 0.26 $ =~ /(\d+)\.(\d+)/);
 
 use constant DEFAULT_KIDS => 3;
 
@@ -194,6 +192,11 @@ many different queries your program will be running, how much RAM you
 have, how often you run queries, and most importantly, how many
 queries you intend to run I<simultaneously>.
 
+=item ErrorState
+
+An listref containing a session and event name to receive error
+messages from the DBI.  The message arrives in ARG0.
+
 =back
 
 =cut
@@ -220,6 +223,8 @@ sub new {
     my $debug = delete $params{Debug} || 0;
     # $count = 1 if $debug;
 
+    my $errorstate = delete $params{ErrorState} || undef;
+
     # Make sure the user didn't pass in parameters we're not aware of.
     if (scalar keys %params) {
 	carp( "unknown parameters in $type constructor call: ",
@@ -233,13 +238,21 @@ sub new {
     $self->{queries} = $queries;
     $self->{count} = $count;
     $self->{debug} = $debug;
+    $self->{errorstate} = $errorstate;
     $self->{finish} = 0;
     $self->{pending_query_count} = 0;
     $self->{active_query_count} = 0;
+    $self->{cookies} = [];
+    $self->{group_cache} = [];
 
-    POE::Session->new( $self,
-		       [ qw [ _start _stop db_reply remote_stderr error ] ]
-		     );
+#     POE::Session->new( $self,
+# 		       [ qw [ _start _stop db_reply remote_stderr error ] ]
+# 		     );
+
+    POE::Session->create( object_states =>
+                          [ $self => [ qw [ _start _stop db_reply remote_stderr error ] ] ]
+                        );
+
     return $self;
 
 }
@@ -279,9 +292,9 @@ Return rows hash references instead of array references.
 
 A cookie to pass to this query.  This is passed back unchanged to the
 destination state in C<$_[ARG1]>.  Can be any scalar (including
-references, so be careful!).  You can use this as an identifier if you
-have one destination state handling multiple different queries or
-sessions.
+references, and even POE postbacks, so be careful!).  You can use this
+as an identifier if you have one destination state handling multiple
+different queries or sessions.
 
 =item delay
 
@@ -305,6 +318,13 @@ concurrency has priority over transfer rate.
 
 Naturally, the Time::HiRes module is required for this functionality.
 If Time::HiRes is not installed, the delay is ignored.
+
+=item group
+
+Sends the return event back when C<group> rows are retrieved from the
+database, to avoid event spam when selecting lots of rows. NB: using
+group means that C<$row> will be an arrayref of rows, not just a single
+row.
 
 =back
 
@@ -346,6 +366,8 @@ sub query {
 	($package, $state) = ($state, shift @rest);
     }
 
+    # warn "QD: Running $query";
+
     my $agent = $self->{helper}->next;
     my $input = { query => $query,
 		  package => $package, state => $state,
@@ -359,18 +381,21 @@ sub query {
     if ($self->{active_query_count} < $self->{count} ) {
 
 	$input->{id} = $agent->ID;
+	$self->{cookies}[$input->{id}] = delete $input->{cookie};
 	$agent->put( $input );
 	$self->{active_query_count}++;
+	$self->{group_cache}[$input->{id}] = [];
 
     } else {
 	push @{$self->{pending_queries}}, $input;
     }
 
     $self->debug
-      && warn sprintf("QA:(#%s) %d pending: %s => %s\n",
+      && warn sprintf("QA:(#%s) %d pending: %s => %s, return %d rows at once\n",
 		      $input->{id}, $self->{pending_query_count},
 		      $input->{query},
-		      "$input->{package}::$input->{state}"
+		      "$input->{package}::$input->{state}",
+		      $input->{group} || 1,
 		     );
 
 }
@@ -454,7 +479,6 @@ sub _stop {
 
     # Oracle clients don't like to TERMinate sometimes.
     $self->{helper}->kill_all(9);
-
     $self->debug && warn __PACKAGE__ . " has stopped.\n";
 
 }
@@ -469,11 +493,13 @@ sub db_reply {
     # Parse the "receiving state" and dispatch the input line to that state.
 
     # not needed for Filter::Reference
-    my ($package, $state, $data, $cookie);
+    my ($package, $state, $data, $cookie, $group);
     $package = $input->{package};
     $state = $input->{state};
     $data = $input->{data};
-    $cookie = $input->{cookie};
+    $group = $input->{group} || 0;
+    # change so cookies are no longer sent over the reference channel
+    $cookie = $self->{cookies}[$input->{id}];
 
     unless (ref $data or $data eq 'EOF') {
 	warn "QA: Got $data\n";
@@ -519,6 +545,7 @@ sub db_reply {
 	    my $agent = $self->{helper}->next;
 
 	    $input->{id} = $agent->ID;
+	    $self->{cookies}[$input->{id}] = delete $input->{cookie};
 	    $agent->put( $input );
 	    $self->{active_query_count}++;
 
@@ -530,11 +557,15 @@ sub db_reply {
 			  );
 
 	}
-
     }
-
-    if (defined $data) {
-	$kernel->post($package => $state => $data => $cookie);
+    if ($group) {
+        push @{ $self->{group_cache}[$input->{id}] }, $data;
+	if (scalar @{ $self->{group_cache}[$input->{id}] } == $group || $data eq 'EOF') {
+	    $kernel->post($package => $state => $self->{group_cache}[$input->{id}], $cookie);
+	    $self->{group_cache}[$input->{id}] = [];
+	}
+    } else {
+        $kernel->post($package => $state => $data => $cookie);
     }
 
 
@@ -545,14 +576,11 @@ sub db_reply {
 # {{{ remote_stderr
 
 sub remote_stderr {
-    my ($self, $operation, $errnum, $errstr, $wheel_id) = @_[OBJECT, ARG0..ARG3];
+    my ($self, $kernel, $operation, $errnum, $errstr, $wheel_id, $data) = @_[OBJECT, KERNEL, ARG0..ARG4];
 
-    #$self->debug && warn "read from qa: $operation";
+    $self->debug && warn defined $errstr ? "$operation: $errstr\n" : "$operation\n";
 
-    my $error = $operation;
-
-    $self->debug && warn "$operation: $errstr\n";
-
+    $kernel->post(@{$self->{errorstate}}, $operation, $errstr, $wheel_id) if defined $self->{errorstate};
 }
 
 # }}} remote_stderr

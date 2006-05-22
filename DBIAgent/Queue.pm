@@ -33,17 +33,25 @@ use Class::MethodMaker
   list          => [ qw( _queue ) ],
   ;
 
-sub init {
-    my $self = shift;
-
-    return $self;
-}
 
 =head2 Methods
 
 This are the methods we recognize:
 
 =over 4
+
+=item init
+
+init the queue (currently noop)
+
+=cut
+
+sub init {
+    my $self = shift;
+
+    return $self;
+}
+
 
 =item add
 
@@ -164,7 +172,8 @@ Tell all our helpers to exit gracefully.
 
 sub exit_all {
     my $self = shift;
-    $_->put("EXIT") foreach $self->_queue;
+    #++ modified command to stop POE::Filter::Reference moaning
+    $_->put({query => "EXIT"}) foreach $self->_queue;
 }
 
 

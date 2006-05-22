@@ -1,5 +1,15 @@
 Revision history for Perl extension POE::Component::DBIAgent. -*-text-*-
 
+0.25 Doc cleanups. Code cleanups.
+
+0.24 Added patches from fluffle on #poe to add support for
+     returning rows in batches instead of one at a time.  This is a
+     performance speedup, in most cases.
+
+0.23 Internal revision
+
+0.22 Internal revision
+
 0.21 Forgot to add the parameter passing code in the main to complete
      cookie support.  The HELPER understood it... <sigh>
 
